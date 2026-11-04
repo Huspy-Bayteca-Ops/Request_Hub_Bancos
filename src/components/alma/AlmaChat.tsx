@@ -26,6 +26,8 @@ const TOOL_LABELS: Record<string, string> = {
   ofertas_pendientes: 'Revisando las ofertas por revisar…',
   equipo: 'Mirando quién lleva qué…',
   preparar_mensaje_slack: 'Preparando el mensaje de Slack…',
+  estado_dossier: 'Revisando el estado del dossier…',
+  regenerar_dossier: 'Preparando la regeneración del dossier…',
 }
 
 // Guía «Cómo usarme»: vídeo corto + ejemplos que se pueden lanzar con un clic
@@ -48,6 +50,8 @@ const SUGGESTIONS = [
   '¿Cuántos dossieres enviamos ayer?',
 ]
 
+interface DossierRegen { deal_id: number; motivo: string; importe_hipoteca?: number; state: 'idle' | 'sending' | 'done' | 'error'; info?: string }
+
 interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
@@ -58,6 +62,8 @@ interface ChatMessage {
   reportMsg?: string
   error?: boolean
   slack?: { destinatario: string; nombre: string; mensaje: string; state: 'draft' | 'sending' | 'sent' | 'error'; info?: string }
+  // Una respuesta puede proponer varias regeneraciones (p. ej. dos importes): una tarjeta por cada una.
+  regens?: DossierRegen[]
   dbId?: string | null
   feedback?: { rating: 'up' | 'down'; comment: string; state: 'editing' | 'sending' | 'sent' | 'error'; info?: string }
 }
@@ -199,6 +205,7 @@ export default function AlmaChat({ apiBase = '/api/alma', envLabel }: { apiBase?
           else if (ev.type === 'tool') patch(botId, (m) => ({ ...m, status: TOOL_LABELS[ev.name as string] ?? 'Consultando datos…' }))
           else if (ev.type === 'technical') patch(botId, (m) => ({ ...m, technical: ev.resumen as string, report: 'idle' }))
           else if (ev.type === 'slack_draft') patch(botId, (m) => ({ ...m, slack: { destinatario: ev.destinatario as string, nombre: ev.nombre as string, mensaje: ev.mensaje as string, state: 'draft' } }))
+          else if (ev.type === 'dossier_regen') patch(botId, (m) => ({ ...m, regens: [...(m.regens ?? []), { deal_id: Number(ev.deal_id), motivo: String(ev.motivo ?? ''), importe_hipoteca: Number(ev.importe_hipoteca) || undefined, state: 'idle' }] }))
           else if (ev.type === 'error') patch(botId, (m) => ({ ...m, text: m.text || (typeof ev.message === 'string' && ev.message ? ev.message : 'Algo ha fallado. ¿Lo intentas otra vez?'), status: null, error: true }))
           else if (ev.type === 'done') patch(botId, (m) => ({ ...m, status: null, dbId: (ev.message_id as string | null) ?? null }))
         }
@@ -241,6 +248,25 @@ export default function AlmaChat({ apiBase = '/api/alma', envLabel }: { apiBase?
       patch(id, (m) => ({ ...m, slack: { ...slack, state: res.ok ? 'sent' : 'error', info: res.ok ? `¡Enviado a ${slack.nombre} por Slack!` : data.error || 'No se pudo enviar.' } }))
     } catch {
       patch(id, (m) => ({ ...m, slack: { ...slack, state: 'error', info: 'No se pudo enviar.' } }))
+    }
+  }, [apiBase, conversationId, patch])
+
+  const regenDossier = useCallback(async (id: string, idx: number, regen: DossierRegen) => {
+    const set = (r: DossierRegen) => patch(id, (m) => ({ ...m, regens: (m.regens ?? []).map((x, i) => (i === idx ? r : x)) }))
+    set({ ...regen, state: 'sending' })
+    try {
+      const res = await fetch(`${apiBase}/dossier`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation_id: conversationId, deal_id: regen.deal_id, motivo: regen.motivo, importe_hipoteca: regen.importe_hipoteca }),
+      })
+      const data = await res.json().catch(() => ({}))
+      const info = data.accepted
+        ? 'En marcha. El dossier nuevo llegará a Drive, al Command Center, al ticket del Request Hub y a Slack en unos minutos.'
+        : data.error || (data.reason ? `No se pudo lanzar (${data.reason}).` : 'No se pudo lanzar.')
+      set({ ...regen, state: data.accepted ? 'done' : 'error', info })
+    } catch {
+      set({ ...regen, state: 'error', info: 'No se pudo lanzar.' })
     }
   }, [apiBase, conversationId, patch])
 
@@ -439,6 +465,27 @@ export default function AlmaChat({ apiBase = '/api/alma', envLabel }: { apiBase?
                         )}
                       </div>
                     )}
+                    {m.regens?.map((r, i) => (
+                      <div key={i} className="rounded-xl bg-emerald-50 px-3 py-2 text-[12px] text-emerald-950 ring-1 ring-emerald-200">
+                        <p className="font-medium">📄 Regenerar el dossier del deal {r.deal_id}</p>
+                        <p className="mt-0.5 text-emerald-900/80">
+                          Importe de hipoteca: {r.importe_hipoteca ? <strong>{r.importe_hipoteca.toLocaleString('es-ES')} €</strong> : 'el de Pipedrive'}
+                        </p>
+                        {r.motivo && <p className="mt-0.5 text-emerald-900/80">{r.motivo}</p>}
+                        {r.state === 'done' || r.state === 'error' ? (
+                          <p className={`mt-1 ${r.state === 'error' ? 'text-red-700' : ''}`}>{r.info}</p>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={r.state === 'sending'}
+                            onClick={() => regenDossier(m.id, i, r)}
+                            className="mt-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
+                          >
+                            {r.state === 'sending' ? 'Lanzando…' : 'Regenerar dossier'}
+                          </button>
+                        )}
+                      </div>
+                    ))}
                     {m.dbId && !m.status && !m.error && (
                       <div className="text-[12px] text-gray-500">
                         {!m.feedback || (m.feedback.state === 'error' && m.feedback.rating === 'up') ? (
