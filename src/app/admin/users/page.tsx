@@ -1,5 +1,5 @@
 import type { Metadata } from 'next'
-import { requireProfile } from '@/lib/auth'
+import { requireAdmin } from '@/lib/auth'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { Navbar } from '@/components/layout/Navbar'
 import { UserManagementClient } from '@/components/admin/UserManagementClient'
@@ -27,7 +27,7 @@ export type CategoryWithRule = {
 }
 
 export default async function UsersPage() {
-  const profile = await requireProfile()
+  const profile = await requireAdmin()
   const admin   = createAdminClient()
 
   const [{ data: profiles }, { data: categories }] = await Promise.all([
