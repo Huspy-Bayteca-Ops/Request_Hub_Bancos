@@ -1,5 +1,5 @@
 import type { Metadata } from 'next'
-import { notFound } from 'next/navigation'
+import { notFound, redirect } from 'next/navigation'
 import { requireProfile } from '@/lib/auth'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { Navbar } from '@/components/layout/Navbar'
@@ -21,6 +21,12 @@ interface Props {
 export default async function TicketDetailPage({ params }: Props) {
   const { id }      = await params
   const profile     = await requireProfile()
+
+  // Admins manage tickets from the admin view (assign, priority, status…).
+  // Covers every /tickets/[id] link: Slack, email, Pipedrive notes, notifications.
+  const role = profile.role
+  if (role === 'admin') redirect(`/admin/tickets/${id}`)
+
   const adminClient = createAdminClient()
 
   // Use admin client so system-created tickets (created_by=NULL) are always reachable.
