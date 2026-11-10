@@ -591,6 +591,7 @@ export async function GET(request: NextRequest) {
         : []),
     ].filter(g => g.deals.length > 0)
 
+    let createdForRule = 0
     for (const group of groups) {
       const groupDeals = group.deals
 
@@ -678,10 +679,12 @@ export async function GET(request: NextRequest) {
           entry.count++
         }
       }
-      summary.push(
-        `${group.categoryName}: ${deals.length} deals en stage, ${created} tickets creados, ${skipped} ya existían`,
-      )
+      createdForRule += created
+      summary.push(`${group.categoryName}: ${created} tickets creados`)
     }
+    summary.push(
+      `${rule.stageName} (stage ${rule.stageId}): ${deals.length} deals en stage, ${createdForRule} tickets creados, ${skipped} ya existían`,
+    )
   }
 
   // ── Send one summary DM per assignee ─────────────────────────
