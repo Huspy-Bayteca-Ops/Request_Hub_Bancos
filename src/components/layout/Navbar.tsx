@@ -31,7 +31,7 @@ export function Navbar({ profile, isAdmin = false }: Props) {
         {/* Logo + nav */}
         <div className="flex items-center gap-6">
           <Link
-            href="/tickets"
+            href="/home"
             className="flex items-center gap-2.5 no-underline hover:opacity-90 transition-opacity"
           >
             {/* Co-brand lockup: Bayteca + MD */}
@@ -56,17 +56,17 @@ export function Navbar({ profile, isAdmin = false }: Props) {
                 priority
               />
             </div>
-            <span className="text-sm font-medium text-gray-500 hidden sm:inline">Request Hub</span>
+            <span className="text-sm font-medium text-gray-500 hidden sm:inline">Home</span>
           </Link>
 
           <nav className="flex items-center gap-1 text-sm">
             {[
-              { href: '/tickets', label: 'Mis Solicitudes', admin: false },
+              { href: '/tickets', label: 'Mis Solicitudes', admin: false, hideForAdmin: true },
               { href: '/admin/tickets', label: 'Todos los Tickets', admin: true },
               { href: '/dashboard', label: 'Dashboard', admin: true },
               { href: '/admin/users', label: 'Usuarios', admin: true },
             ]
-              .filter(l => !l.admin || isAdmin)
+              .filter(l => (!l.admin || isAdmin) && !(l.hideForAdmin && isAdmin))
               .map(l => {
                 const active = pathname === l.href || pathname.startsWith(l.href + '/')
                 return (

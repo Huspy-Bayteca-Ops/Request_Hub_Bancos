@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse }                    from 'next/server'
 import { createAdminClient }                            from '@/lib/supabase/admin'
-import { fetchOpenDealsInStage, fetchDealStatus, updateDealField, createDealNote, FIELD_DEAL_SUMMARY, type StageDeal } from '@/lib/pipedrive'
+import { fetchOpenDealsInStage, fetchDealStatus, fetchDealStageId, updateDealField, createDealNote, FIELD_DEAL_SUMMARY, type StageDeal } from '@/lib/pipedrive'
 import { postSlackDM, buildCronSummaryMessage, buildSnoozeReopenedMessage } from '@/lib/notifications/slack'
 import { isConfigured, listSheetNames, fetchDealScoringData, DealScoringData } from '@/lib/sheets'
 
@@ -20,6 +20,12 @@ const FIELD_FEIN_TS            = 'b61aafe43b4c3c4d8a1a70675beaaffa529bb295'
 
 const FIELD_BANK_NAME = 'c3a445b9bf0422b9db09abc776cf2dc281b7e975'
 
+// Opportunity ID: links the bank deal to its general deal (pipeline 6)
+const FIELD_OPPORTUNITY_ID = '71edfe1562e9e19d4c7d96d38548dd009d4b3601'
+
+// Pipeline 6 stages from "Bank offers received" (65) onwards → the general deal already has an offer
+const GENERAL_DEAL_WITH_OFFERS_STAGES = new Set([65, 78, 66, 67, 68, 69])
+
 // ── Overdue rules ─────────────────────────────────────────────
 
 interface OverdueRule {
@@ -29,12 +35,15 @@ interface OverdueRule {
   thresholdHours:   number
   maxThresholdHours?: number
   stageName:        string
+  // When set, deals whose general deal already has offers go to this category instead
+  withOffersCategoryName?: string
 }
 
 const OVERDUE_RULES: OverdueRule[] = [
   {
     stageId:          70,
-    categoryName:     'Bank Submission Overdue',
+    categoryName:     'Bank Submission Overdue - Sin Otras Ofertas',
+    withOffersCategoryName: 'Bank Submission Overdue - Con otras Ofertas',
     timestampField:   FIELD_BANK_SUBMISSION_TS,
     thresholdHours:   48,
     maxThresholdHours: 360, // 15 days — ignore if deal has been stuck too long
@@ -72,7 +81,8 @@ interface AutoCloseRule {
 }
 
 const AUTO_CLOSE_RULES: AutoCloseRule[] = [
-  { categoryName: 'Bank Submission Overdue',  triggerStage: 70 },
+  { categoryName: 'Bank Submission Overdue - Sin Otras Ofertas', triggerStage: 70 },
+  { categoryName: 'Bank Submission Overdue - Con otras Ofertas', triggerStage: 70 },
   { categoryName: 'Valuation Overdue',        triggerStage: 72 },
   { categoryName: 'FEIN Overdue',             triggerStage: 73 },
   { categoryName: 'Acelerar emisión de FEIN', triggerStage: 73 },
@@ -126,6 +136,35 @@ function formatDuration(hours: number): string {
   const rem  = Math.floor(hours % 24)
   if (days === 0) return `${Math.floor(hours)} horas`
   return rem > 0 ? `${days} días y ${rem}h` : `${days} días`
+}
+
+// Returns the IDs of the bank deals whose general deal (pipeline 6) is at
+// "Bank offers received" or later. Deals without Opportunity ID or whose
+// general deal can't be fetched count as "sin otras ofertas".
+async function findDealsWithOtherOffers(deals: StageDeal[]): Promise<Set<number>> {
+  const generalIdByDeal = new Map<number, number>()
+  for (const deal of deals) {
+    const generalId = Number(deal[FIELD_OPPORTUNITY_ID])
+    if (Number.isInteger(generalId) && generalId > 0) generalIdByDeal.set(deal.id, generalId)
+  }
+
+  const uniqueGeneralIds = [...new Set(generalIdByDeal.values())]
+  const generalWithOffers = new Set<number>()
+  const BATCH_SIZE = 10
+  for (let i = 0; i < uniqueGeneralIds.length; i += BATCH_SIZE) {
+    const batch = uniqueGeneralIds.slice(i, i + BATCH_SIZE)
+    const stages = await Promise.all(batch.map(id => fetchDealStageId(id)))
+    batch.forEach((id, j) => {
+      const stageId = stages[j]
+      if (stageId !== null && GENERAL_DEAL_WITH_OFFERS_STAGES.has(stageId)) generalWithOffers.add(id)
+    })
+  }
+
+  const result = new Set<number>()
+  for (const [dealId, generalId] of generalIdByDeal) {
+    if (generalWithOffers.has(generalId)) result.add(dealId)
+  }
+  return result
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -537,92 +576,114 @@ export async function GET(request: NextRequest) {
       continue
     }
 
-    // Batch round-robin: single RPC returns one email per new deal
-    const { data: assigneeEmails } = await admin.rpc('pick_assignees_batch', {
-      p_category_id: categoryId,
-      p_count:       newDeals.length,
-    })
+    // Split into categories: deals whose general deal already has offers go to
+    // withOffersCategoryName (if configured and present in DB), the rest to categoryName
+    const withOffersCategoryId = rule.withOffersCategoryName
+      ? (categoryMap.get(rule.withOffersCategoryName) ?? null)
+      : null
+    const dealsWithOffers = withOffersCategoryId
+      ? await findDealsWithOtherOffers(newDeals)
+      : new Set<number>()
+    const groups = [
+      { categoryId, categoryName: rule.categoryName, deals: newDeals.filter(d => !dealsWithOffers.has(d.id)) },
+      ...(withOffersCategoryId
+        ? [{ categoryId: withOffersCategoryId, categoryName: rule.withOffersCategoryName!, deals: newDeals.filter(d => dealsWithOffers.has(d.id)) }]
+        : []),
+    ].filter(g => g.deals.length > 0)
 
-    // Batch resolve unique emails → profile ids
-    const emailList  = [...new Set((assigneeEmails as string[] | null) ?? [])]
-    const { data: profiles } = await admin
-      .from('profiles')
-      .select('id, email')
-      .in('email', emailList)
-    const emailToId = new Map((profiles ?? []).map(p => [p.email, p.id as string]))
+    let createdForRule = 0
+    for (const group of groups) {
+      const groupDeals = group.deals
 
-    const slaDeadline = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+      // Batch round-robin: single RPC returns one email per new deal
+      const { data: assigneeEmails } = await admin.rpc('pick_assignees_batch', {
+        p_category_id: group.categoryId,
+        p_count:       groupDeals.length,
+      })
 
-    // Build all rows, then bulk insert in one request
-    const rows = newDeals.map((deal, i) => {
-      const email      = (assigneeEmails as string[] | null)?.[i] ?? null
-      const assigneeId = email ? (emailToId.get(email) ?? null) : null
-      const dealId     = deal.id
-      const bankName   = (deal[FIELD_BANK_NAME] as string | null)
-        ?? (deal.title as string | null)
-        ?? `Deal #${dealId}`
-      const clientName = deal.person_id?.name ?? null
-      const hours      = hoursElapsed(deal[rule.timestampField])
-      const description = [
-        `Deal #${dealId} lleva ${formatDuration(hours)} en stage ${rule.stageName}.`,
-        `Banco: ${bankName}`,
-        `Responsable en Pipedrive: ${(deal.user_id as { name?: string } | null)?.name ?? 'Sin asignar'}`,
-        `Ver deal: https://app.pipedrive.com/deal/${dealId}`,
-        ``,
-        `Ticket generado automáticamente por Request Hub Bancos.`,
-      ].join('\n')
+      // Batch resolve unique emails → profile ids
+      const emailList  = [...new Set((assigneeEmails as string[] | null) ?? [])]
+      const { data: profiles } = await admin
+        .from('profiles')
+        .select('id, email')
+        .in('email', emailList)
+      const emailToId = new Map((profiles ?? []).map(p => [p.email, p.id as string]))
 
-      const scorePriority = derivePriorityFromScore(dealId, scoringData)
+      const slaDeadline = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
 
-      return {
-        created_by:        null,
-        assignee_id:       assigneeId,
-        category_id:       categoryId,
-        subject:           `[Auto] ${rule.categoryName} – Deal #${dealId} – ${bankName}`,
-        description,
-        priority:          scorePriority ?? derivePriority(rule, hours),
-        status:            'new' as const,
-        sla_hours:         48,
-        sla_deadline:      slaDeadline,
-        bank_name:         bankName,
-        client_name:       clientName,
-        pipedrive_deal_id: dealId,
+      // Build all rows, then bulk insert in one request
+      const rows = groupDeals.map((deal, i) => {
+        const email      = (assigneeEmails as string[] | null)?.[i] ?? null
+        const assigneeId = email ? (emailToId.get(email) ?? null) : null
+        const dealId     = deal.id
+        const bankName   = (deal[FIELD_BANK_NAME] as string | null)
+          ?? (deal.title as string | null)
+          ?? `Deal #${dealId}`
+        const clientName = deal.person_id?.name ?? null
+        const hours      = hoursElapsed(deal[rule.timestampField])
+        const description = [
+          `Deal #${dealId} lleva ${formatDuration(hours)} en stage ${rule.stageName}.`,
+          `Banco: ${bankName}`,
+          `Responsable en Pipedrive: ${(deal.user_id as { name?: string } | null)?.name ?? 'Sin asignar'}`,
+          `Ver deal: https://app.pipedrive.com/deal/${dealId}`,
+          ``,
+          `Ticket generado automáticamente por Request Hub Bancos.`,
+        ].join('\n')
+
+        const scorePriority = derivePriorityFromScore(dealId, scoringData)
+
+        return {
+          created_by:        null,
+          assignee_id:       assigneeId,
+          category_id:       group.categoryId,
+          subject:           `[Auto] ${group.categoryName} – Deal #${dealId} – ${bankName}`,
+          description,
+          priority:          scorePriority ?? derivePriority(rule, hours),
+          status:            'new' as const,
+          sla_hours:         48,
+          sla_deadline:      slaDeadline,
+          bank_name:         bankName,
+          client_name:       clientName,
+          pipedrive_deal_id: dealId,
+        }
+      })
+
+      const { data: createdTickets, error: insertErr } = await admin
+        .from('tickets').insert(rows).select('id, display_id, pipedrive_deal_id')
+      if (insertErr) {
+        console.error(`[cron] bulk insert error category=${group.categoryName}:`, insertErr)
       }
-    })
 
-    const { data: createdTickets, error: insertErr } = await admin
-      .from('tickets').insert(rows).select('id, display_id, pipedrive_deal_id')
-    if (insertErr) {
-      console.error(`[cron] bulk insert error category=${rule.categoryName}:`, insertErr)
-    }
-
-    // Fire-and-forget Pipedrive note for each auto-created ticket
-    for (const t of createdTickets ?? []) {
-      if (t.pipedrive_deal_id) {
-        createDealNote(
-          t.pipedrive_deal_id as number,
-          `🎟 Ticket automático creado: ${t.display_id}\nVer ticket: ${appUrl}/tickets/${t.id}`,
-        ).catch(console.error)
+      // Fire-and-forget Pipedrive note for each auto-created ticket
+      for (const t of createdTickets ?? []) {
+        if (t.pipedrive_deal_id) {
+          createDealNote(
+            t.pipedrive_deal_id as number,
+            `🎟 Ticket automático creado: ${t.display_id}\nVer ticket: ${appUrl}/tickets/${t.id}`,
+          ).catch(console.error)
+        }
       }
-    }
 
-    const created = insertErr ? 0 : newDeals.length
-    totalCreated += created
+      const created = insertErr ? 0 : groupDeals.length
+      totalCreated += created
 
-    // Accumulate per-assignee counts for summary DM
-    if (!insertErr) {
-      for (let i = 0; i < newDeals.length; i++) {
-        const email = (assigneeEmails as string[] | null)?.[i]
-        if (!email) continue
-        if (!assigneeSummaries.has(email)) assigneeSummaries.set(email, [])
-        const entries = assigneeSummaries.get(email)!
-        let entry = entries.find(e => e.categoryName === rule.categoryName)
-        if (!entry) { entry = { categoryName: rule.categoryName, count: 0 }; entries.push(entry) }
-        entry.count++
+      // Accumulate per-assignee counts for summary DM
+      if (!insertErr) {
+        for (let i = 0; i < groupDeals.length; i++) {
+          const email = (assigneeEmails as string[] | null)?.[i]
+          if (!email) continue
+          if (!assigneeSummaries.has(email)) assigneeSummaries.set(email, [])
+          const entries = assigneeSummaries.get(email)!
+          let entry = entries.find(e => e.categoryName === group.categoryName)
+          if (!entry) { entry = { categoryName: group.categoryName, count: 0 }; entries.push(entry) }
+          entry.count++
+        }
       }
+      createdForRule += created
+      summary.push(`${group.categoryName}: ${created} tickets creados`)
     }
     summary.push(
-      `${rule.categoryName}: ${deals.length} deals en stage, ${created} tickets creados, ${skipped} ya existían`,
+      `${rule.stageName} (stage ${rule.stageId}): ${deals.length} deals en stage, ${createdForRule} tickets creados, ${skipped} ya existían`,
     )
   }
 

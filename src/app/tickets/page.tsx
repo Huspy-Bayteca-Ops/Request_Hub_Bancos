@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
+import { redirect } from 'next/navigation'
 import { requireProfile } from '@/lib/auth'
 import { createClient } from '@/lib/supabase/server'
 import { Navbar } from '@/components/layout/Navbar'
@@ -22,6 +23,11 @@ interface Props {
 export default async function MyTicketsPage({ searchParams }: Props) {
   const sp      = await searchParams
   const profile = await requireProfile()
+
+  // Admins don't have "Mis Solicitudes": they work from "Todos los tickets"
+  const role = profile.role
+  if (role === 'admin') redirect('/admin/tickets')
+
   const supabase = await createClient()
 
   // "Mis Solicitudes" = tickets I created OR follow — for every role.

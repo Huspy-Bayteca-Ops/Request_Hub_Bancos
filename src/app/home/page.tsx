@@ -67,7 +67,7 @@ export default async function HomePage() {
           <div className={`grid grid-cols-1 ${isAdmin ? 'sm:grid-cols-2' : ''} gap-5 ${isAdmin ? 'max-w-xl' : 'max-w-xs'} mx-auto`}>
 
             {/* Ticket System */}
-            <Link href="/tickets"
+            <Link href={isAdmin ? '/admin/tickets' : '/tickets'}
               className="home-card home-card-green group flex flex-col items-center gap-5 p-9 home-card-in"
               style={{ animationDelay: '0.5s' }}
             >
