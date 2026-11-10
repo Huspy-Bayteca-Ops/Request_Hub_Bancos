@@ -1,6 +1,6 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
-import { requireProfile } from '@/lib/auth'
+import { requireAdmin } from '@/lib/auth'
 import { createClient } from '@/lib/supabase/server'
 import { Navbar } from '@/components/layout/Navbar'
 import { AdminFilters } from '@/components/admin/AdminFilters'
@@ -27,7 +27,7 @@ interface Props {
 
 export default async function AdminTicketsPage({ searchParams }: Props) {
   const sp       = await searchParams
-  const profile  = await requireProfile()
+  const profile  = await requireAdmin()
   const supabase = await createClient()
 
   // Base query — RLS admin policy returns all tickets.
