@@ -92,9 +92,17 @@ export default async function AdminTicketsPage({ searchParams }: Props) {
               {(tickets?.length ?? 0) >= PAGE_SIZE && ' · usa filtros para acotar'}
             </p>
           </div>
-          <Link href="/dashboard" className="text-sm text-gray-600 hover:text-gray-900 underline-offset-2 hover:underline">
-            Dashboard →
-          </Link>
+          <div className="flex items-center gap-4">
+            <Link href="/dashboard" className="text-sm text-gray-600 hover:text-gray-900 underline-offset-2 hover:underline">
+              Dashboard →
+            </Link>
+            <Link
+              href="/tickets/new"
+              className="inline-flex items-center gap-2 px-4 py-2 bg-[#083D20] text-white text-sm font-medium rounded-lg hover:bg-[#0a4d28] transition-colors"
+            >
+              + Nueva Solicitud
+            </Link>
+          </div>
         </div>
 
         <AdminFilters current={sp} admins={admins ?? []} categories={categories ?? []} />
